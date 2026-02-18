@@ -5,17 +5,13 @@ set(COMPONENT_PRIV_REQUIRES )
 set(COMPONENT_SRCS 
     "main.cpp" 
     "ota/idf_update.cpp" 
-    "led/led_strip_encoder.c"
 )
 set(COMPONENT_ADD_INCLUDEDIRS 
     "." 
     "audio" 
     "ble" 
     "config" 
-    "core"
     "dsp" 
-    "input" 
-    "led" 
     "ota" 
     "storage"
 )

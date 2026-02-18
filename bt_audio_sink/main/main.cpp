@@ -36,16 +36,6 @@
 #include <sys/stat.h>
 #include <string.h>  // for strerror
 
-// LED Matrix support
-#ifdef CONFIG_LED_MATRIX_ENABLE
-#include "led/led_controller.h"
-#endif
-
-// Encoder support
-#ifdef CONFIG_ENCODER_ENABLE
-#include "input/encoder_controller.h"
-#endif
-
 static const char* TAG = "Main";
 
 // -----------------------------------------------------------
@@ -137,165 +127,7 @@ static void applyEq(int8_t bass, int8_t mid, int8_t treble, bool notifyBle = tru
     if (notifyBle) {
         g_ble.updateEq(bass, mid, treble);
     }
-    
-    // Sync encoder controller if encoders are enabled
-    #ifdef CONFIG_ENCODER_ENABLE
-    EncoderController::getInstance().setCurrentEq(bass, mid, treble);
-    #endif
 }
-
-// -----------------------------------------------------------
-// Encoder callbacks (hardware rotary encoders)
-// -----------------------------------------------------------
-#ifdef CONFIG_ENCODER_ENABLE
-static void onEncoderVolume(uint8_t volume) {
-    // Volume encoder: set absolute volume (0-127)
-    g_a2dp.set_volume(volume);
-    
-    // Update LED effect with volume level
-    #ifdef CONFIG_LED_MATRIX_ENABLE
-    LedController::getInstance().setVolume(volume);
-    #endif
-    
-    ESP_LOGI(TAG, "Encoder volume: %d", volume);
-}
-
-static void onEncoderPlayPause() {
-    // Volume encoder button single click: toggle play/pause
-    static bool isPlaying = true;
-    if (isPlaying) {
-        g_a2dp.pause();
-    } else {
-        g_a2dp.play();
-    }
-    isPlaying = !isPlaying;
-    ESP_LOGI(TAG, "Encoder: %s", isPlaying ? "play" : "pause");
-}
-
-static void onEncoderNextTrack() {
-    // Volume encoder button double click: next track
-    g_a2dp.next();
-    ESP_LOGI(TAG, "Encoder: next track");
-}
-
-static void onEncoderPrevTrack() {
-    // Volume encoder button triple click: previous track
-    g_a2dp.previous();
-    ESP_LOGI(TAG, "Encoder: previous track");
-}
-
-static void onEncoderEq(int8_t bass, int8_t mid, int8_t treble) {
-    // EQ encoders: apply new values and sync to app
-    applyEq(bass, mid, treble);
-    
-    // Show EQ overlay on LED matrix
-    #ifdef CONFIG_LED_MATRIX_ENABLE
-    // Determine which EQ band changed (simple heuristic: compare to cached values)
-    static int8_t lastBass = 0, lastMid = 0, lastTreble = 0;
-    uint8_t changedType = 255;  // 255 = unknown/all
-    if (bass != lastBass) changedType = 0;
-    else if (mid != lastMid) changedType = 1;
-    else if (treble != lastTreble) changedType = 2;
-    lastBass = bass; lastMid = mid; lastTreble = treble;
-    
-    LedController::getInstance().setEq(bass, mid, treble, changedType);
-    #endif
-    
-    ESP_LOGI(TAG, "Encoder EQ: %d/%d/%d", bass, mid, treble);
-}
-
-static void onEncoderBrightness(uint8_t brightness) {
-    // Bass encoder button: adjust brightness
-    #ifdef CONFIG_LED_MATRIX_ENABLE
-    LedController::getInstance().setBrightness(brightness, true);  // Save to NVS
-    
-    // Notify app - copy current LED settings and update brightness
-    const uint8_t* currentSettings = LedController::getInstance().getLedSettings();
-    uint8_t settings[10];
-    memcpy(settings, currentSettings, 10);
-    settings[0] = brightness;  // Update brightness byte
-    g_ble.updateLed(settings, sizeof(settings));
-    
-    ESP_LOGI(TAG, "Encoder brightness: %d", brightness);
-    #endif
-}
-
-static void onEncoderPairingMode() {
-    // Mid encoder button: enter pairing mode
-    // If connected, disconnect first
-    esp_a2d_connection_state_t state = g_a2dp.get_connection_state();
-    
-    // Set pairing mode flag - prevents disconnect callback from interfering
-    g_pairingModeActive = true;
-    
-    if (state == ESP_A2D_CONNECTION_STATE_CONNECTED) {
-        ESP_LOGI(TAG, "Disconnecting current device to enter pairing mode...");
-        g_a2dp.disconnect();
-        vTaskDelay(pdMS_TO_TICKS(500));  // Wait for disconnect
-    }
-    
-    // Reset I2S to default sample rate for sound playback
-    g_sampleRate = APP_I2S_DEFAULT_SAMPLE_RATE;
-    g_i2s.updateClock(APP_I2S_DEFAULT_SAMPLE_RATE);
-    g_dsp.setSampleRate(APP_I2S_DEFAULT_SAMPLE_RATE);
-    
-    // Enable discoverable mode for new device pairing
-    // ESP_BT_GENERAL_DISCOVERABLE = visible to all devices for pairing
-    ESP_LOGI(TAG, "Entering pairing mode - device is now discoverable");
-    g_a2dp.set_discoverability(ESP_BT_GENERAL_DISCOVERABLE);
-    
-    // Play pairing sound (exclusive mode - no A2DP during pairing anyway)
-    // Use actual I2S sample rate to ensure proper resampling
-    g_sound.play(SOUND_PAIRING, g_i2s.getSampleRate(), SOUND_MODE_EXCLUSIVE);
-    
-    // Start pairing mode LED animation (slow blue pulsing)
-    #ifdef CONFIG_LED_MATRIX_ENABLE
-    LedController::getInstance().setPairingMode(true);
-    #endif
-    
-    // NOTE: g_pairingModeActive stays true until a device connects
-    // This prevents the disconnect callback from resetting discoverability or LED animation
-}
-
-static void onEncoderEffectChange(int effectId, bool confirmed) {
-    // Treble encoder: change LED effect
-    #ifdef CONFIG_LED_MATRIX_ENABLE
-    // Preview mode: don't save to NVS (save=false)
-    // Confirmed mode: save to NVS (save=true)
-    LedController::getInstance().setEffect(effectId, confirmed);
-    
-    // Always notify app of effect change (both preview and confirmed)
-    g_ble.updateLedEffect((uint8_t)effectId);
-    
-    if (confirmed) {
-        // Effect confirmed - also update full LED settings
-        const uint8_t* currentSettings = LedController::getInstance().getLedSettings();
-        g_ble.updateLed(currentSettings, 10);
-        
-        ESP_LOGI(TAG, "Encoder effect confirmed: %d (%s)", effectId, 
-                 LedController::getInstance().getCurrentEffectName());
-    } else {
-        // Just previewing
-        ESP_LOGI(TAG, "Encoder effect preview: %d (%s)", effectId, 
-                 LedController::getInstance().getCurrentEffectName());
-    }
-    #endif
-}
-
-static void onEncoder3DSound(bool enabled) {
-    // Treble encoder button double-click: toggle 3D sound effect
-    g_dsp.set3DSound(enabled);
-    g_settings.save3DSound(enabled);
-    
-    // Play a subtle feedback sound
-    if (g_a2dpConnected && g_sound.hasSound(enabled ? SOUND_STARTUP : SOUND_STARTUP)) {
-        // Quick beep feedback - but don't interrupt music
-        ESP_LOGI(TAG, "3D Sound toggled %s via encoder", enabled ? "ON" : "OFF");
-    }
-    
-    ESP_LOGI(TAG, "Encoder 3D Sound: %s", enabled ? "ON" : "OFF");
-}
-#endif
 
 // -----------------------------------------------------------
 // BLE callbacks
@@ -309,19 +141,6 @@ static void onBleEq(int8_t bass, int8_t mid, int8_t treble) {
     applyEq(bass, mid, treble, false);  // Don't notify back - command came from phone
     
     // Note: encoder sync already done in applyEq
-    
-    // Show EQ overlay on LED matrix (same as encoder)
-    #ifdef CONFIG_LED_MATRIX_ENABLE
-    // Determine which EQ band changed (compare to cached values)
-    static int8_t lastBleBass = 0, lastBleMid = 0, lastBleTreble = 0;
-    uint8_t changedType = 255;  // 255 = unknown/all
-    if (bass != lastBleBass) changedType = 0;
-    else if (mid != lastBleMid) changedType = 1;
-    else if (treble != lastBleTreble) changedType = 2;
-    lastBleBass = bass; lastBleMid = mid; lastBleTreble = treble;
-    
-    LedController::getInstance().setEq(bass, mid, treble, changedType);
-    #endif
     
     ESP_LOGI(TAG, "BLE EQ: %d/%d/%d", bass, mid, treble);
 }
@@ -363,89 +182,6 @@ static void onBleName(const char* name, size_t len) {
     ESP_LOGI(TAG, "BLE name changed: %s", name);
 }
 
-#ifdef CONFIG_LED_MATRIX_ENABLE
-static void onBleLedEffect(uint8_t effectId) {
-    LedController::getInstance().setEffect(effectId);
-    g_settings.saveLedEffect(effectId);
-    // Don't notify back - command came from phone
-    
-    // Sync encoder controller's effect value
-    #ifdef CONFIG_ENCODER_ENABLE
-    EncoderController::getInstance().setCurrentEffect(effectId);
-    #endif
-    
-    ESP_LOGI(TAG, "LED effect: %s", LedController::getInstance().getCurrentEffectName());
-}
-
-// Fast brightness conversion: 0-100 -> 0-255 using multiply+shift (no division)
-// Formula: (v * 41) >> 4 ≈ v * 2.5625 (true factor: 2.55)
-static inline uint8_t brightness100to255(uint8_t v) {
-    uint16_t out = (v * 41) >> 4;
-    return (out > 255) ? 255 : (uint8_t)out;
-}
-
-// LED settings callback - handles full 10-byte packet from phone:
-// Phone sends: [effectId, brightness(0-100), speed, r1, g1, b1, r2, g2, b2, gradient]
-// Internal format: [brightness(0-255), r1, g1, b1, r2, g2, b2, gradient, speed, effectId]
-static void onBleLedSettings(const uint8_t* data, size_t len) {
-    if (len < 10) return;
-    
-    // Extract values from phone format
-    uint8_t effectId       = data[0];
-    uint8_t brightness100  = data[1];  // Phone sends 0-100
-    uint8_t speed          = data[2];
-    uint8_t r1             = data[3];
-    uint8_t g1             = data[4];
-    uint8_t b1             = data[5];
-    uint8_t r2             = data[6];
-    uint8_t g2             = data[7];
-    uint8_t b2             = data[8];
-    uint8_t gradient       = data[9];
-    
-    // Convert brightness from phone 0-100 to internal 0-255
-    uint8_t brightness255 = brightness100to255(brightness100);
-    
-    // Reorder to internal format for LED controller (using 0-255 brightness)
-    uint8_t reordered[10] = {
-        brightness255, r1, g1, b1, r2, g2, b2, gradient, speed, effectId
-    };
-    
-    // Pass to LED controller (handles brightness + ambient effect settings)
-    LedController::getInstance().setLedSettings(reordered, 10);
-    
-    // Also set the effect
-    LedController::getInstance().setEffect(effectId);
-    
-    // Sync encoder controller's brightness value (using internal 0-255)
-    #ifdef CONFIG_ENCODER_ENABLE
-    EncoderController::getInstance().setCurrentBrightness(brightness255);
-    EncoderController::getInstance().setCurrentEffect(effectId);
-    #endif
-    
-    // Don't notify back - command came from phone
-
-    ESP_LOGI(TAG, "LED settings: effect=%d, brightness=%d->%d, speed=%d, gradient=%d",
-             effectId, brightness100, brightness255, speed, gradient);
-}
-
-// LED brightness callback - handles brightness-only updates
-// Phone sends brightness in 0-100 range
-static void onBleLedBrightness(uint8_t brightness100) {
-    // Convert from phone 0-100 to internal 0-255
-    uint8_t brightness255 = brightness100to255(brightness100);
-    
-    LedController::getInstance().setBrightness(brightness255, true);  // Save to NVS
-    
-    // Sync encoder controller's brightness value (using internal 0-255)
-    #ifdef CONFIG_ENCODER_ENABLE
-    EncoderController::getInstance().setCurrentBrightness(brightness255);
-    #endif
-    
-    // Don't notify back - command came from phone
-    ESP_LOGI(TAG, "LED brightness: %d -> %d", brightness100, brightness255);
-}
-#endif
-
 static volatile uint32_t g_otaReceived = 0;
 static volatile uint32_t g_otaTotalSize = 0;
 
@@ -480,12 +216,6 @@ static void onBleOtaCtrl(const uint8_t* data, size_t len) {
         g_a2dp.set_output_active(false);
         g_i2s.stop();  // Stop I2S to free resources
         
-        // Enable LED OTA progress display
-        #ifdef CONFIG_LED_MATRIX_ENABLE
-        LedController::getInstance().setOtaMode(true);
-        LedController::getInstance().setOtaProgress(0);
-        #endif
-        
         g_otaActive = true;
         g_otaReceived = 0;
         g_otaTotalSize = size;
@@ -495,9 +225,6 @@ static void onBleOtaCtrl(const uint8_t* data, size_t len) {
             ESP_LOGE(TAG, "OTA begin failed: %s", g_update.errorString());
             g_ble.notifyOtaCtrl("BEGIN_ERR");
             g_otaActive = false;
-            #ifdef CONFIG_LED_MATRIX_ENABLE
-            LedController::getInstance().setOtaMode(false);
-            #endif
             g_i2s.start();
         } else {
             ESP_LOGI(TAG, "OTA begin OK, waiting for data...");
@@ -618,12 +345,6 @@ static void onBleOtaCtrl(const uint8_t* data, size_t len) {
         g_a2dp.set_output_active(false);
         g_i2s.stop();  // Stop I2S to free resources
         
-        // Enable LED OTA progress display
-        #ifdef CONFIG_LED_MATRIX_ENABLE
-        LedController::getInstance().setOtaMode(true);
-        LedController::getInstance().setOtaProgress(0);
-        #endif
-        
         g_otaActive = true;
         g_otaReceived = 0;
         g_otaTotalSize = size;
@@ -633,9 +354,6 @@ static void onBleOtaCtrl(const uint8_t* data, size_t len) {
             ESP_LOGE(TAG, "OTA begin failed: %s", g_update.errorString());
             g_ble.notifyOtaCtrl("BEGIN_ERR");
             g_otaActive = false;
-            #ifdef CONFIG_LED_MATRIX_ENABLE
-            LedController::getInstance().setOtaMode(false);
-            #endif
             g_i2s.start();
         } else {
             ESP_LOGI(TAG, "OTA begin OK, waiting for data...");
@@ -692,11 +410,6 @@ static void onBleOtaData(const uint8_t* data, size_t len) {
     
     // Calculate and update progress
     uint8_t pct = (g_otaTotalSize > 0) ? (uint8_t)((uint64_t)g_otaReceived * 100 / g_otaTotalSize) : 0;
-    
-    // Update LED progress in real-time
-    #ifdef CONFIG_LED_MATRIX_ENABLE
-    LedController::getInstance().setOtaProgress(pct);
-    #endif
     
     // Log progress at each 5% milestone
     static uint8_t lastPctLogged = 255;
@@ -1385,10 +1098,6 @@ static void onConnectionState(esp_a2d_connection_state_t state, void* user) {
             g_a2dp.set_discoverability(ESP_BT_NON_DISCOVERABLE);
             ESP_LOGI(TAG, "Discoverability disabled - press pairing button for new devices");
             
-            // Stop pairing animation if running (only if not intentionally in pairing mode)
-            #ifdef CONFIG_LED_MATRIX_ENABLE
-            LedController::getInstance().setPairingMode(false);
-            #endif
         } else {
             ESP_LOGI(TAG, "In pairing mode - keeping discoverable and LED animation active");
         }
@@ -1424,16 +1133,6 @@ static void onConnectionState(esp_a2d_connection_state_t state, void* user) {
         
         // Connected sound is now played by buttonsTask after codec stabilizes
         // (see g_connectedSoundPending flag set in onCodecConfig)
-        
-        // Show pairing success animation if we were in pairing mode
-        #ifdef CONFIG_LED_MATRIX_ENABLE
-        if (LedController::getInstance().isPairingModeActive()) {
-            LedController::getInstance().showPairingSuccess();
-        } else {
-            // Just in case, stop pairing mode
-            LedController::getInstance().setPairingMode(false);
-        }
-        #endif
     }
 }
 
@@ -1469,50 +1168,30 @@ static void buttonsTask(void* arg) {
     uint32_t debounce1 = 0, pressStart1 = 0;
     bool lastBtn2 = true, btn2State = true;
     uint32_t debounce2 = 0;
-    
-    // LED effect button (can be separate or shared with button 2)
-    #ifdef CONFIG_LED_MATRIX_ENABLE
-    bool lastBtnLed = true, btnLedState = true;
-    uint32_t debounceLed = 0;
-    #ifdef CONFIG_LED_EFFECT_BUTTON_GPIO
-        const gpio_num_t ledBtnGpio = (gpio_num_t)CONFIG_LED_EFFECT_BUTTON_GPIO;
-        // Only init if different from existing buttons
-        if (ledBtnGpio != APP_BUTTON1_GPIO && ledBtnGpio != APP_BUTTON2_GPIO) {
-            gpio_config_t ledBtn = {};
-            ledBtn.intr_type = GPIO_INTR_DISABLE;
-            ledBtn.mode = GPIO_MODE_INPUT;
-            ledBtn.pin_bit_mask = (1ULL << ledBtnGpio);
-            ledBtn.pull_up_en = GPIO_PULLUP_ENABLE;
-            gpio_config(&ledBtn);
-        }
-    #else
-        const gpio_num_t ledBtnGpio = (gpio_num_t)19;  // Default
-    #endif
-    #endif
 
     while (true) {
         uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
         
         // Check if connected sound is pending and codec has stabilized
-        if (g_connectedSoundPending) {
-            int64_t timeSinceCodecConfig = esp_timer_get_time() - g_lastCodecConfigTime;
-            if (timeSinceCodecConfig >= CODEC_STABLE_DELAY_US) {
-                g_connectedSoundPending = false;
+        // if (g_connectedSoundPending) {
+        //     int64_t timeSinceCodecConfig = esp_timer_get_time() - g_lastCodecConfigTime;
+        //     if (timeSinceCodecConfig >= CODEC_STABLE_DELAY_US) {
+        //         g_connectedSoundPending = false;
                 
-                // Check if this is a codec switch (rapid reconnect) - don't play sound
-                int64_t timeSinceDisconnect = g_lastCodecConfigTime - g_lastDisconnectTime;
-                bool isCodecSwitch = (g_lastDisconnectTime > 0) && (timeSinceDisconnect < CODEC_SWITCH_TIMEOUT_US);
+        //         // Check if this is a codec switch (rapid reconnect) - don't play sound
+        //         int64_t timeSinceDisconnect = g_lastCodecConfigTime - g_lastDisconnectTime;
+        //         bool isCodecSwitch = (g_lastDisconnectTime > 0) && (timeSinceDisconnect < CODEC_SWITCH_TIMEOUT_US);
                 
-                if (isCodecSwitch) {
-                    ESP_LOGI(TAG, "Codec switch detected - skipping connected sound");
-                } else {
-                    ESP_LOGI(TAG, "Codec stable for %lld ms - playing connected sound at %u Hz",
-                             timeSinceCodecConfig / 1000, (unsigned)g_i2s.getSampleRate());
-                    // Use EXCLUSIVE mode - takes over I2S, no mixing
-                    g_sound.play(SOUND_CONNECTED, g_i2s.getSampleRate(), SOUND_MODE_EXCLUSIVE);
-                }
-            }
-        }
+        //         if (isCodecSwitch) {
+        //             ESP_LOGI(TAG, "Codec switch detected - skipping connected sound");
+        //         } else {
+        //             ESP_LOGI(TAG, "Codec stable for %lld ms - playing connected sound at %u Hz",
+        //                      timeSinceCodecConfig / 1000, (unsigned)g_i2s.getSampleRate());
+        //             // Use EXCLUSIVE mode - takes over I2S, no mixing
+        //             g_sound.play(SOUND_CONNECTED, g_i2s.getSampleRate(), SOUND_MODE_EXCLUSIVE);
+        //         }
+        //     }
+        // }
         
         bool r1 = gpio_get_level((gpio_num_t)APP_BUTTON1_GPIO);
         if (r1 != lastBtn1) debounce1 = now;
@@ -1549,23 +1228,6 @@ static void buttonsTask(void* arg) {
         }
         lastBtn2 = r2;
 
-        // LED effect cycle button
-        #ifdef CONFIG_LED_MATRIX_ENABLE
-        bool rLed = gpio_get_level(ledBtnGpio);
-        if (rLed != lastBtnLed) debounceLed = now;
-        if ((now - debounceLed) > 25 && rLed != btnLedState) {
-            btnLedState = rLed;
-            if (rLed == 1) {  // Button released
-                LedController::getInstance().nextEffect();
-                uint8_t newEffect = LedController::getInstance().getCurrentEffectId();
-                g_settings.saveLedEffect(newEffect);
-                g_ble.updateLedEffect(newEffect);
-                ESP_LOGI(TAG, "LED effect: %s", LedController::getInstance().getCurrentEffectName());
-            }
-        }
-        lastBtnLed = rLed;
-        #endif
-
         vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
@@ -1597,10 +1259,6 @@ static void beatTask(void* arg) {
                     flashOffMs = now + APP_BEAT_FLASH_DURATION_MS;
                     lastBeatMs = now;
                     
-                    // Signal beat to LED matrix
-                    #ifdef CONFIG_LED_MATRIX_ENABLE
-                    setLedBeat(true);
-                    #endif
                 }
             } else {
                 bassSmooth *= 0.9f;
@@ -1611,10 +1269,6 @@ static void beatTask(void* arg) {
                 gpio_set_level((gpio_num_t)APP_BEAT_LED_GPIO, 0);
                 flashActive = false;
                 
-                // Clear beat signal
-                #ifdef CONFIG_LED_MATRIX_ENABLE
-                setLedBeat(false);
-                #endif
             }
 
             // Update BLE levels every 50ms
@@ -1829,42 +1483,8 @@ extern "C" void app_main(void) {
     gpio_set_level((gpio_num_t)APP_BEAT_LED_GPIO, 0);
 
     // ========================================================================
-    // STARTUP SEQUENCE: Play startup sound + LED animation BEFORE BLE/A2DP
-    // Both must complete before initializing anything else
+    // STARTUP SEQUENCE: Play startup sound
     // ========================================================================
-    
-    // Start LED matrix task first (needed for startup animation)
-    #ifdef CONFIG_LED_MATRIX_ENABLE
-    #if APP_HAS_PSRAM
-    startLedTask(&g_dsp, 3, 8192);  // 8KB stack - PSRAM available
-    #else
-    startLedTask(&g_dsp, 3, 4096);  // 4KB stack - no PSRAM, conserve memory
-    #endif
-    ESP_LOGI(TAG, "LED matrix started on GPIO %d", CONFIG_LED_MATRIX_GPIO);
-    
-    // Give LED task time to initialize before requesting animation
-    vTaskDelay(pdMS_TO_TICKS(100));
-    
-    // Start startup sound and LED animation together
-    bool hasStartupSound = g_sound.hasSound(SOUND_STARTUP);
-    if (hasStartupSound) {
-        ESP_LOGI(TAG, "Playing startup sound + animation...");
-        g_sound.play(SOUND_STARTUP, g_i2s.getSampleRate(), SOUND_MODE_EXCLUSIVE);
-    } else {
-        ESP_LOGI(TAG, "Playing startup animation (no sound)...");
-    }
-    LedController::getInstance().requestStartupAnimation();
-    
-    // Small delay to ensure animation starts (flag is set before playStartupAnimation runs)
-    vTaskDelay(pdMS_TO_TICKS(50));
-    
-    // Wait for BOTH sound AND LED animation to complete
-    while (g_sound.isPlaying() || LedController::getInstance().isStartupAnimationRunning()) {
-        vTaskDelay(pdMS_TO_TICKS(50));
-    }
-    ESP_LOGI(TAG, "Startup sequence complete - sound and LED animation finished");
-    
-    #else
     // No LED matrix - just play startup sound and wait for completion
     if (g_sound.hasSound(SOUND_STARTUP)) {
         ESP_LOGI(TAG, "Playing startup sound...");
@@ -1874,31 +1494,11 @@ extern "C" void app_main(void) {
         }
         ESP_LOGI(TAG, "Startup sound complete");
     }
-    #endif
     // ========================================================================
     // END STARTUP SEQUENCE - Now initialize BLE, A2DP, and other services
     // ========================================================================
 
     // Initialize BLE
-    #ifdef CONFIG_LED_MATRIX_ENABLE
-    // Unified BLE callbacks: EQ, EqPreset, Control, Name, LED, LedEffect, LedBright, SoundMute, SoundDelete, SoundData, OTA
-    g_ble.setCallbacks(
-        onBleEq,            // EqCallback
-        onBleEqPreset,      // EqPresetCallback
-        onBleControl,       // ControlCallback
-        onBleName,          // NameCallback
-        onBleLedSettings,   // LedCallback (full 10-byte settings)
-        onBleLedEffect,     // LedEffectCallback
-        onBleLedBrightness, // LedBrightnessCallback
-        onBleSoundMute,     // SoundMuteCallback
-        onBleSoundDelete,   // SoundDeleteCallback
-        onBleSoundUpload,   // SoundDataCallback
-        onBleOtaUnified     // OtaCallback
-    );
-    uint8_t savedLedEffect = g_settings.loadLedEffect();
-    uint8_t savedBrightness = LedController::getInstance().getBrightness();
-    g_ble.init(deviceName.c_str(), APP_FW_VERSION, getControlByte(), eqBass, eqMid, eqTreble, savedLedEffect, savedBrightness);
-    #else
     // Unified BLE callbacks without LED matrix
     g_ble.setCallbacks(
         onBleEq,            // EqCallback
@@ -1914,7 +1514,7 @@ extern "C" void app_main(void) {
         onBleOtaUnified     // OtaCallback
     );
     g_ble.init(deviceName.c_str(), APP_FW_VERSION, getControlByte(), eqBass, eqMid, eqTreble);
-    #endif
+
     
     // Initialize BLE sound status with current sound player status
     // This ensures the correct status is sent when a client connects
@@ -1941,14 +1541,6 @@ extern "C" void app_main(void) {
     
     // Volume change callback - sync with LED and encoder controller
     g_a2dp.set_avrc_rn_volumechange([](int volume) {
-        #ifdef CONFIG_LED_MATRIX_ENABLE
-        LedController::getInstance().setVolume((uint8_t)volume);
-        #endif
-        #ifdef CONFIG_ENCODER_ENABLE
-        // Sync encoder controller with phone's volume so local adjustments are relative
-        EncoderController::getInstance().setCurrentVolume((uint8_t)volume);
-        ESP_LOGI(TAG, "Phone volume changed to %d - encoder synced", volume);
-        #endif
         
         // Skip max volume sound during connection grace period (ignore initial volume report)
         // Also skip if g_lastConnectTime is 0 (no connection yet - system still initializing)
@@ -1999,44 +1591,6 @@ extern "C" void app_main(void) {
     xTaskCreatePinnedToCore(audioTxTask, "audio_tx", 8192, nullptr, configMAX_PRIORITIES - 2, nullptr, 1);
     xTaskCreate(buttonsTask, "buttons", 2048, nullptr, 5, nullptr);
     xTaskCreate(beatTask, "beat", 2048, nullptr, 4, nullptr);
-
-    // Initialize and start encoder task
-    #ifdef CONFIG_ENCODER_ENABLE
-    {
-        auto& enc = EncoderController::getInstance();
-        enc.setVolumeCallback(onEncoderVolume);
-        enc.setPlayPauseCallback(onEncoderPlayPause);
-        enc.setNextTrackCallback(onEncoderNextTrack);
-        enc.setPrevTrackCallback(onEncoderPrevTrack);
-        enc.setEqCallback(onEncoderEq);
-        enc.setBrightnessCallback(onEncoderBrightness);
-        enc.setPairingModeCallback(onEncoderPairingMode);
-        enc.setEffectCallback(onEncoderEffectChange);
-        enc.set3DSoundCallback(onEncoder3DSound);
-        
-        // Set initial values from NVS
-        enc.setCurrentVolume((uint8_t)g_a2dp.get_volume());  // Get current volume (0-127)
-        enc.setCurrentEq(eqBass, eqMid, eqTreble);
-        
-        // Load 3D sound state from NVS
-        bool sound3D = g_settings.load3DSound();
-        enc.setCurrent3DSound(sound3D);
-        g_dsp.set3DSound(sound3D);
-        if (sound3D) {
-            ESP_LOGI(TAG, "3D Sound: ON (loaded from NVS)");
-        }
-        
-        #ifdef CONFIG_LED_MATRIX_ENABLE
-        enc.setCurrentBrightness(LedController::getInstance().getBrightness());
-        enc.setCurrentEffect(LedController::getInstance().getCurrentEffectId());
-        enc.setMaxEffect(LED_EFFECT_COUNT);
-        #endif
-        
-        startEncoderTask();  // Uses default priority 2, pinned to core 0
-        ESP_LOGI(TAG, "Encoder controller started on I2C SDA=%d, SCL=%d",
-                 ENCODER_I2C_SDA_GPIO, ENCODER_I2C_SCL_GPIO);
-    }
-    #endif
 
     ESP_LOGI(TAG, "System ready");
 }
